@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(idf.py fullclean *)",
+      "Bash(idf.py build *)",
+      "Bash(ls /Users/jack/.espressif/v6.0.2/esp-idf/components/ | grep -i mdn)",
+      "Read(//Users/jack/.espressif/v6.0.2/esp-idf/components/**)",
+      "Bash(grep -r \"COMPONENT_NAME\\\\|__component_name\\\\|register\" /Users/jack/.espressif/v6.0.2/esp-idf/components/mdns/CMakeLists.txt 2>/dev/null | head -5; echo \"---\"; head -20 /Users/jack/.espressif/v6.0.2/esp-idf/components/mdns/CMakeLists.txt 2>/dev/null)",
+      "Read(//Users/jack/.espressif/v6.0.2/esp-idf/components/mdns/**)",
+      "Bash(ls /Users/jack/.espressif/v6.0.2/esp-idf/components/ | sort)",
+      "Read(//Users/jack/.espressif/v6.0.2/esp-idf/components/esp_driver_uart/**)",
+      "Read(//Users/jack/.espressif/v6.0.2/esp-idf/components/esp_driver_uart/include/driver/**)",
+      "Read(//Users/jack/.espressif/v6.0.2/esp-idf/components/esp_driver_gpio/**)",
+      "Bash(cat /Users/jack/.espressif/v6.0.2/esp-idf/components/driver/CMakeLists.txt 2>/dev/null | head -20)",
+      "Read(//Users/jack/.espressif/v6.0.2/esp-idf/components/driver/**)",
+      "Bash(grep -r \"UART_PIN_NO_CHANGE\" /Users/jack/.espressif/v6.0.2/esp-idf/components/esp_driver_uart/include/ 2>/dev/null | head -3)",
+      "Read(//Users/jack/.espressif/v6.0.2/esp-idf/components/esp_driver_uart/include/**)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}

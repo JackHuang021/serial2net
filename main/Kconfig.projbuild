@@ -1,0 +1,120 @@
+menu "Serial2Net Configuration"
+
+    menu "WiFi Settings"
+        choice SERIAL2NET_WIFI_MODE
+            prompt "WiFi Mode"
+            default SERIAL2NET_WIFI_MODE_STA_AP_FALLBACK
+            help
+                Select the WiFi operation mode.
+
+            config SERIAL2NET_WIFI_MODE_STA
+                bool "Station (connect to router)"
+            config SERIAL2NET_WIFI_MODE_AP
+                bool "Access Point (ESP32 creates hotspot)"
+            config SERIAL2NET_WIFI_MODE_STA_AP_FALLBACK
+                bool "Station + AP fallback (try STA first, fallback to AP)"
+        endchoice
+
+        config SERIAL2NET_WIFI_STA_SSID
+            string "Station SSID"
+            default "myssid"
+            help
+                WiFi SSID to connect to in Station mode.
+
+        config SERIAL2NET_WIFI_STA_PASSWORD
+            string "Station Password"
+            default "mypassword"
+            help
+                WiFi password for Station mode.
+
+        config SERIAL2NET_WIFI_STA_MAX_RETRY
+            int "Station max retry count"
+            default 5
+            range 1 30
+            help
+                Maximum number of connection retries before giving up
+                (only used in STA+AP fallback mode).
+
+        config SERIAL2NET_WIFI_AP_SSID
+            string "AP SSID"
+            default "serial2net"
+            help
+                SSID for Access Point mode (MAC address suffix auto-appended).
+
+        config SERIAL2NET_WIFI_AP_PASSWORD
+            string "AP Password"
+            default "12345678"
+            help
+                Password for the Access Point (min 8 characters).
+    endmenu
+
+    menu "UART Settings"
+        config SERIAL2NET_UART_PORT
+            int "UART Port Number"
+            default 2
+            range 0 2
+            help
+                UART port number. UART0 is usually reserved for console.
+                UART1 and UART2 are available for peripheral connections.
+
+        config SERIAL2NET_UART_BAUD
+            int "Baud Rate"
+            default 115200
+            range 1200 4000000
+            help
+                UART baud rate for communication with the target device.
+
+        config SERIAL2NET_UART_TX_PIN
+            int "TX GPIO Pin"
+            default 17 if IDF_TARGET_ESP32S3
+            default 6 if IDF_TARGET_ESP32C3
+            default 17 if IDF_TARGET_ESP32
+            default 1
+            help
+                GPIO pin for UART TX (connect to target device RX).
+
+        config SERIAL2NET_UART_RX_PIN
+            int "RX GPIO Pin"
+            default 16 if IDF_TARGET_ESP32S3
+            default 7 if IDF_TARGET_ESP32C3
+            default 16 if IDF_TARGET_ESP32
+            default 3
+            help
+                GPIO pin for UART RX (connect to target device TX).
+
+        config SERIAL2NET_UART_BUFFER_SIZE
+            int "UART RX Buffer Size"
+            default 2048
+            range 256 8192
+            help
+                Size of the UART RX ring buffer in bytes.
+    endmenu
+
+    menu "LED Settings"
+        config SERIAL2NET_LED_ENABLE
+            bool "Enable WS2812B RGB LED"
+            default y
+            help
+                Enable WS2812B/Neopixel RGB LED for status indication.
+
+        config SERIAL2NET_LED_PIN
+            int "WS2812B Data Pin"
+            default 48 if IDF_TARGET_ESP32S3
+            default 8 if IDF_TARGET_ESP32C3
+            default 18 if IDF_TARGET_ESP32
+            default 8
+            help
+                GPIO pin connected to the WS2812B data input.
+                ESP32-S3 default GPIO48 (common on dev boards).
+    endmenu
+
+    menu "TCP Settings"
+        config SERIAL2NET_TCP_PORT
+            int "TCP Listen Port"
+            default 8880
+            range 1024 65535
+            help
+                TCP port the server listens on for incoming connections.
+    endmenu
+
+endmenu

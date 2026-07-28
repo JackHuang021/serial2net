@@ -1,0 +1,5 @@
+dependencies:
+  espressif/mdns:
+    version: "^1.0"
+  espressif/led_strip:
+    version: "^3.0"
