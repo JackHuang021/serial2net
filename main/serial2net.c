@@ -25,6 +25,7 @@
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include "sdkconfig.h"
+#include "telnet.h"
 
 static const char *TAG = "serial2net";
 
@@ -39,6 +40,11 @@ static int wifi_retry_count = 0;
 static int listen_sock = -1;
 static int client_sock = -1;
 static bool client_connected = false;
+
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+static int  telnet_listen_sock = -1;
+static bool client_is_telnet   = false;
+#endif
 
 /* ---- UART State ---- */
 static QueueHandle_t uart_queue;
@@ -429,6 +435,86 @@ static void tcp_server_init(void)
     ESP_LOGI(TAG, "TCP server listening on port %d", CONFIG_SERIAL2NET_TCP_PORT);
 }
 
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+/* ---- Telnet Server ---- */
+
+static void telnet_server_init(void)
+{
+    struct sockaddr_in server_addr = {0};
+
+    telnet_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (telnet_listen_sock < 0) {
+        ESP_LOGE(TAG, "Telnet: failed to create socket: errno %d", errno);
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(telnet_listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(telnet_listen_sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(CONFIG_SERIAL2NET_TELNET_PORT);
+
+    if (bind(telnet_listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "Telnet: socket bind failed: errno %d", errno);
+        close(telnet_listen_sock);
+        telnet_listen_sock = -1;
+        return;
+    }
+
+    if (listen(telnet_listen_sock, 1) < 0) {
+        ESP_LOGE(TAG, "Telnet: socket listen failed: errno %d", errno);
+        close(telnet_listen_sock);
+        telnet_listen_sock = -1;
+        return;
+    }
+
+    ESP_LOGI(TAG, "Telnet server listening on port %d", CONFIG_SERIAL2NET_TELNET_PORT);
+}
+
+// Telnet accept task — accepts Telnet connections on the Telnet port
+static void telnet_accept_task(void *pvParameters)
+{
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+
+    while (1) {
+        if (telnet_listen_sock < 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        int sock = accept(telnet_listen_sock, (struct sockaddr *)&client_addr, &addr_len);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Telnet accept failed: errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Kick old client if any (regardless of whether it was raw or telnet)
+        if (client_connected && client_sock >= 0) {
+            ESP_LOGI(TAG, "Telnet: new client — closing previous connection");
+            close(client_sock);
+        }
+
+        int nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+        client_sock     = sock;
+        client_connected = true;
+        client_is_telnet = true;
+        current_led_state = LED_CLIENT_CONNECTED;
+
+        // Initialize Telnet protocol state and send negotiation
+        telnet_init_session(sock);
+
+        ESP_LOGI(TAG, "Telnet client connected from %s:%d",
+                 inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+    }
+}
+#endif // CONFIG_SERIAL2NET_TELNET_ENABLE
+
 /* ================================================================
  *  Forwarding Tasks
  * ================================================================ */
@@ -449,10 +535,21 @@ static void uart_to_tcp_task(void *pvParameters)
                                   pdMS_TO_TICKS(50));
         if (len > 0) {
             if (client_connected && client_sock >= 0) {
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+                // Don't send UART data during Telnet negotiation —
+                // raw 0xFF bytes would be misinterpreted as IAC commands
+                if (client_is_telnet && !telnet_is_binary_mode()) {
+                    continue;
+                }
+#endif
                 int sent = send(client_sock, buf, len, 0);
                 if (sent < 0) {
                     ESP_LOGE(TAG, "TCP send error: errno %d", errno);
                     client_connected = false;
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+                    client_is_telnet = false;
+                    telnet_reset();
+#endif
                     close(client_sock);
                     client_sock = -1;
                     led_revert_to_wifi_state();
@@ -484,12 +581,52 @@ static void tcp_to_uart_task(void *pvParameters)
 
         int len = recv(client_sock, buf, CONFIG_SERIAL2NET_UART_BUFFER_SIZE, 0);
         if (len > 0) {
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+            // Telnet: check negotiation timeout before processing data
+            if (client_is_telnet && telnet_negotiation_timed_out()) {
+                ESP_LOGW(TAG, "Telnet: binary negotiation timed out, closing");
+                client_connected = false;
+                client_is_telnet = false;
+                telnet_reset();
+                close(client_sock);
+                client_sock = -1;
+                led_revert_to_wifi_state();
+                continue;
+            }
+
+            if (client_is_telnet) {
+                // Telnet connections always pass through the IAC filter,
+                // even after binary mode is negotiated.  Reason: the
+                // client may still emit IAC commands after it processes
+                // our WILL BINARY (delayed WILL/WONT/DONT for options
+                // that were never explicitly acknowledged).  If those
+                // IAC bytes leak to UART and the target echoes them
+                // back, they appear as garbage on the user's terminal.
+                //
+                // The filter correctly handles literal 0xFF bytes
+                // (sent by the client as IAC-IAC per RFC 854), so
+                // this is safe for all normal console traffic.
+                for (int i = 0; i < len; i++) {
+                    if (telnet_process_rx_byte(buf[i])) {
+                        uart_write_bytes(CONFIG_SERIAL2NET_UART_PORT, &buf[i], 1);
+                    }
+                }
+            } else {
+                // Raw TCP — true transparent passthrough
+                uart_write_bytes(CONFIG_SERIAL2NET_UART_PORT, buf, len);
+            }
+#else
             uart_write_bytes(CONFIG_SERIAL2NET_UART_PORT, buf, len);
+#endif
             led_signal_activity();
         } else if (len == 0) {
             // Client closed connection
             ESP_LOGI(TAG, "TCP client disconnected");
             client_connected = false;
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+            client_is_telnet = false;
+            telnet_reset();
+#endif
             close(client_sock);
             client_sock = -1;
             led_revert_to_wifi_state();
@@ -500,6 +637,10 @@ static void tcp_to_uart_task(void *pvParameters)
             } else {
                 ESP_LOGE(TAG, "TCP recv error: errno %d, closing", errno);
                 client_connected = false;
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+                client_is_telnet = false;
+                telnet_reset();
+#endif
                 close(client_sock);
                 client_sock = -1;
                 led_revert_to_wifi_state();
@@ -537,8 +678,12 @@ static void tcp_accept_task(void *pvParameters)
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        client_sock = sock;
+        client_sock      = sock;
         client_connected = true;
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+        client_is_telnet = false;
+        telnet_reset();
+#endif
         current_led_state = LED_CLIENT_CONNECTED;
         ESP_LOGI(TAG, "TCP client connected from %s:%d",
                  inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
@@ -576,16 +721,30 @@ void app_main(void)
     // Initialize UART
     uart_init();
 
-    // Initialize TCP server
+    // Initialize TCP server (raw)
     tcp_server_init();
+
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+    // Initialize Telnet server (RFC 854/856)
+    telnet_server_init();
+#endif
 
     // Start forwarding tasks
     xTaskCreate(uart_to_tcp_task, "uart2tcp", 4096, NULL, 10, NULL);
     xTaskCreate(tcp_to_uart_task, "tcp2uart", 4096, NULL, 10, NULL);
     xTaskCreate(tcp_accept_task, "tcp_accept", 4096, NULL, 9, NULL);
 
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+    xTaskCreate(telnet_accept_task, "telnet_accept", 4096, NULL, 9, NULL);
+#endif
+
     ESP_LOGI(TAG, "Bridge running — connect via:");
-    ESP_LOGI(TAG, "  mDNS: serial2net.local:%d", CONFIG_SERIAL2NET_TCP_PORT);
+    ESP_LOGI(TAG, "  Raw TCP: serial2net.local:%d   (socat/nc, low latency)",
+             CONFIG_SERIAL2NET_TCP_PORT);
+#if CONFIG_SERIAL2NET_TELNET_ENABLE
+    ESP_LOGI(TAG, "  Telnet:  serial2net.local:%d   (standard telnet client)",
+             CONFIG_SERIAL2NET_TELNET_PORT);
+#endif
     ESP_LOGI(TAG, "  UART%d: %d baud TX=%d RX=%d",
              CONFIG_SERIAL2NET_UART_PORT, CONFIG_SERIAL2NET_UART_BAUD,
              CONFIG_SERIAL2NET_UART_TX_PIN, CONFIG_SERIAL2NET_UART_RX_PIN);

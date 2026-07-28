@@ -117,4 +117,38 @@ menu "Serial2Net Configuration"
                 TCP port the server listens on for incoming connections.
     endmenu
 
+    menu "Telnet Settings"
+        config SERIAL2NET_TELNET_ENABLE
+            bool "Enable Telnet protocol (RFC 854)"
+            default y
+            help
+                Enable Telnet server (RFC 854 + RFC 856 Binary Transmission)
+                on a separate port. Allows standard telnet clients to connect
+                without any special raw-mode configuration:
+                    telnet serial2net.local
+
+                When disabled, only the raw TCP bridge is available.
+
+        config SERIAL2NET_TELNET_PORT
+            int "Telnet TCP Port"
+            default 23
+            range 1 65535
+            depends on SERIAL2NET_TELNET_ENABLE
+            help
+                TCP port for the Telnet (RFC 854) server.
+                Standard telnet port is 23; use a higher port if running
+                without root privileges on the client side:
+                    telnet serial2net.local 8023
+
+        config SERIAL2NET_TELNET_NEGOTIATION_TIMEOUT_MS
+            int "Telnet negotiation timeout (ms)"
+            default 3000
+            range 500 30000
+            depends on SERIAL2NET_TELNET_ENABLE
+            help
+                Close the Telnet connection if binary transmission mode
+                is not negotiated within this time. Modern telnet clients
+                complete negotiation within milliseconds.
+    endmenu
+
 endmenu
