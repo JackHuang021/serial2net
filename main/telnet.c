@@ -1,5 +1,6 @@
-/*
- * Telnet Protocol (RFC 854 + RFC 856 Binary Transmission)
+/**
+ * @file  telnet.c
+ * @brief Telnet Protocol (RFC 854 + RFC 856 Binary Transmission) implementation
  *
  * Minimal server implementation for serial bridge use.
  * On connect, immediately negotiates binary mode so that after a brief
@@ -16,56 +17,68 @@
 
 static const char *TELNET_TAG = "telnet";
 
-/* ---- Telnet protocol constants (RFC 854) ---- */
-#define TELNET_IAC    255   /* Interpret As Command                    */
-#define TELNET_WILL   251   /* Sender wants to enable option           */
-#define TELNET_WONT   252   /* Sender wants to disable option          */
-#define TELNET_DO     253   /* Sender wants peer to enable option      */
-#define TELNET_DONT   254   /* Sender wants peer to disable option     */
-#define TELNET_SB     250   /* Subnegotiation begin                    */
-#define TELNET_SE     240   /* Subnegotiation end                      */
+/** @name Telnet protocol constants (RFC 854)
+ *  @{ */
+#define TELNET_IAC    255   /**< Interpret As Command                  */
+#define TELNET_WILL   251   /**< Sender wants to enable option         */
+#define TELNET_WONT   252   /**< Sender wants to disable option        */
+#define TELNET_DO     253   /**< Sender wants peer to enable option    */
+#define TELNET_DONT   254   /**< Sender wants peer to disable option   */
+#define TELNET_SB     250   /**< Subnegotiation begin                  */
+#define TELNET_SE     240   /**< Subnegotiation end                    */
+/** @} */
 
-/* ---- Telnet option codes ---- */
-#define TELNET_OPT_BINARY      0   /* RFC 856: Binary Transmission     */
-#define TELNET_OPT_ECHO        1   /* RFC 857: Echo                    */
-#define TELNET_OPT_SGA         3   /* RFC 858: Suppress Go Ahead       */
+/** @name Telnet option codes
+ *  @{ */
+#define TELNET_OPT_BINARY      0   /**< RFC 856: Binary Transmission   */
+#define TELNET_OPT_ECHO        1   /**< RFC 857: Echo                  */
+#define TELNET_OPT_SGA         3   /**< RFC 858: Suppress Go Ahead     */
+/** @} */
 
-/* ---- State machine ---- */
+/** @brief Telnet receiver state machine states */
 typedef enum {
-    TELNET_STATE_DATA,       /* Normal byte passthrough                */
-    TELNET_STATE_IAC,        /* Received 0xFF, awaiting command byte   */
-    TELNET_STATE_OPTION,     /* Received WILL/WONT/DO/DONT, await opt  */
-    TELNET_STATE_SUBNEG,     /* Inside subnegotiation (SB ... IAC SE)  */
-    TELNET_STATE_SUBNEG_IAC, /* Got IAC inside subnegotiation          */
+    TELNET_STATE_DATA,       /**< Normal byte passthrough              */
+    TELNET_STATE_IAC,        /**< Received 0xFF, awaiting command byte */
+    TELNET_STATE_OPTION,     /**< Received WILL/WONT/DO/DONT, awaiting option code */
+    TELNET_STATE_SUBNEG,     /**< Inside subnegotiation (SB ... IAC SE) */
+    TELNET_STATE_SUBNEG_IAC, /**< Got IAC inside subnegotiation        */
 } telnet_state_t;
 
-/* ---- Module state ---- */
-static int             tn_sock = -1;
-static telnet_state_t  tn_state = TELNET_STATE_DATA;
-static bool            tn_binary_rx = false;   /* Client → Server binary */
-static bool            tn_binary_tx = false;   /* Server → Client binary */
+/* ---- Module-level state ---- */
+static int             tn_sock          = -1;
+static telnet_state_t  tn_state         = TELNET_STATE_DATA;
+static bool            tn_binary_rx     = false;   /**< Client → Server binary */
+static bool            tn_binary_tx     = false;   /**< Server → Client binary */
 static TickType_t      tn_connect_ticks = 0;
 
-/* ---- Command byte being processed in OPTION state ---- */
-static uint8_t         tn_pending_cmd = 0;
+static uint8_t         tn_pending_cmd   = 0;       /**< Command byte in OPTION state */
 
-/* ================================================================
- *  Internal helpers
- * ================================================================ */
+/** @defgroup telnet_internal Internal helpers
+ *  @{ */
 
+/**
+ * @brief Send a 3-byte IAC sequence to the peer.
+ *
+ * @param cmd  Telnet command byte (WILL/WONT/DO/DONT).
+ * @param opt  Telnet option code.
+ */
 static void tn_send_triple(uint8_t cmd, uint8_t opt)
 {
     uint8_t seq[3] = { TELNET_IAC, cmd, opt };
     send(tn_sock, seq, sizeof(seq), 0);
 }
 
-/* Respond to a peer's WILL/WONT/DO/DONT for a given option.
+/**
+ * @brief Respond to a peer's WILL/WONT/DO/DONT for a given option.
  *
- * IMPORTANT: Once binary mode is fully negotiated (both tn_binary_rx
- * and tn_binary_tx are set), this function suppresses ALL further IAC
- * responses.  Sending IAC triples after the peer has entered binary RX
- * mode causes them to be treated as raw data — they leak into the
- * display as garbage characters. */
+ * @attention Once binary mode is fully negotiated (both tn_binary_rx and
+ * tn_binary_tx are set), this function suppresses ALL further IAC responses.
+ * Sending IAC triples after the peer has entered binary RX mode causes them
+ * to be treated as raw data — they leak into the display as garbage characters.
+ *
+ * @param cmd  Telnet command byte from the peer.
+ * @param opt  Telnet option code from the peer.
+ */
 static void tn_handle_command(uint8_t cmd, uint8_t opt)
 {
     bool already_binary = tn_binary_rx && tn_binary_tx;
@@ -73,14 +86,16 @@ static void tn_handle_command(uint8_t cmd, uint8_t opt)
     switch (opt) {
 
     case TELNET_OPT_BINARY:
-        /* The initial burst (telnet_init_session) already sent
+        /*
+         * The initial burst (telnet_init_session) already sent
          * DO BINARY and WILL BINARY — the client's DO/WILL BINARY
          * responses are acknowledgments that do not need a reply.
          *
          * Sending further IAC triples here (the "BINARY ACK") would
          * be a second TCP segment that arrives *after* the client has
          * processed our WILL BINARY and entered binary RX mode — the
-         * ACK bytes would leak as raw data onto the user's terminal. */
+         * ACK bytes would leak as raw data onto the user's terminal.
+         */
         if (cmd == TELNET_WILL) {
             tn_binary_rx = true;   /* Peer will send in binary */
         } else if (cmd == TELNET_DO) {
@@ -92,32 +107,54 @@ static void tn_handle_command(uint8_t cmd, uint8_t opt)
         break;
 
     case TELNET_OPT_ECHO:
-        /* We already sent WILL ECHO in the initial burst — the client
+        /*
+         * We already sent WILL ECHO in the initial burst — the client
          * knows we claim to echo and has disabled local echo.  Any
          * further ECHO negotiations from the client are silently
          * ignored: sending DONT / WONT replies would generate IAC
          * traffic that can cross with the binary-mode transition
-         * and leak as garbage characters on the terminal. */
+         * and leak as garbage characters on the terminal.
+         */
         break;
 
     case TELNET_OPT_SGA:
-        /* Same reasoning as ECHO above — our initial WILL SGA already
-         * told the client everything it needs.  No further responses. */
+        /*
+         * Same reasoning as ECHO above — our initial WILL SGA already
+         * told the client everything it needs.  No further responses.
+         */
         break;
 
     default:
-        /* Silently ignore all unknown options — never reject with
+        /*
+         * Silently ignore all unknown options — never reject with
          * DONT / WONT because the reply IAC triple could cross with
-         * the binary-mode transition and leak as raw data. The peer
-         * will eventually stop retrying. */
+         * the binary-mode transition and leak as raw data.  The peer
+         * will eventually stop retrying.
+         */
         break;
     }
 }
 
-/* ================================================================
- *  Public API
- * ================================================================ */
+/** @} */
 
+/** @defgroup telnet_api Public API
+ *  @{ */
+
+/**
+ * @brief Initialize a new Telnet session for the given socket.
+ *
+ * Sends the initial IAC option negotiation sequence to kick off
+ * the binary mode handshake.  Most clients respond within a
+ * single round-trip.
+ *
+ * @attention ORDER IS CRITICAL: WILL BINARY must be the LAST triple sent.
+ * When the client processes IAC WILL BINARY, it enters binary RX
+ * mode and stops interpreting IAC in received data — any IAC
+ * triples that follow would be treated as raw binary data and
+ * appear as garbage characters on the terminal.
+ *
+ * @param sock  TCP socket to send the IAC negotiation on.
+ */
 void telnet_init_session(int sock)
 {
     tn_sock           = sock;
@@ -126,27 +163,27 @@ void telnet_init_session(int sock)
     tn_binary_tx      = false;
     tn_connect_ticks  = xTaskGetTickCount();
 
-    /* Kick off option negotiation immediately.
-     * Most clients respond within a single round-trip.
-     *
-     * ORDER IS CRITICAL: WILL BINARY must be the LAST triple sent.
-     * When the client processes IAC WILL BINARY, it enters binary RX
-     * mode and stops interpreting IAC in received data — any IAC
-     * triples that follow would be treated as raw binary data and
-     * appear as garbage characters on the terminal. */
     tn_send_triple(TELNET_WILL, TELNET_OPT_ECHO);    /* We (pretend to) echo */
     tn_send_triple(TELNET_WILL, TELNET_OPT_SGA);     /* Suppress Go Ahead   */
     tn_send_triple(TELNET_DO,   TELNET_OPT_BINARY);  /* Please use binary   */
     tn_send_triple(TELNET_WILL, TELNET_OPT_BINARY);  /* We will use binary  (MUST BE LAST) */
 }
 
+/**
+ * @brief Process one byte received from the Telnet client.
+ *
+ * This function is called for EVERY byte received from a Telnet
+ * client, both during and after negotiation.  It filters out IAC
+ * command sequences (which would otherwise leak to UART and be
+ * echoed back as garbage) while passing through regular data
+ * bytes including literal 0xFF (sent by the client as IAC-IAC).
+ *
+ * @param byte  A single byte from the TCP stream.
+ * @retval true   Byte should be forwarded to UART.
+ * @retval false  Byte was consumed as Telnet protocol data.
+ */
 bool telnet_process_rx_byte(uint8_t byte)
 {
-    /* This function is called for EVERY byte received from a Telnet
-     * client, both during and after negotiation.  It filters out IAC
-     * command sequences (which would otherwise leak to UART and be
-     * echoed back as garbage) while passing through regular data
-     * bytes including literal 0xFF (sent by the client as IAC-IAC). */
     switch (tn_state) {
 
     case TELNET_STATE_DATA:
@@ -178,7 +215,7 @@ bool telnet_process_rx_byte(uint8_t byte)
         return false;
 
     case TELNET_STATE_OPTION:
-        /* This byte is the option code. Handle and go back to DATA. */
+        /* This byte is the option code.  Handle and go back to DATA. */
         tn_handle_command(tn_pending_cmd, byte);
         tn_state = TELNET_STATE_DATA;
         return false;
@@ -202,11 +239,18 @@ bool telnet_process_rx_byte(uint8_t byte)
     return false;  /* Unreachable */
 }
 
+/** @brief Returns true once BINARY mode is fully negotiated in both directions. */
 bool telnet_is_binary_mode(void)
 {
     return tn_binary_rx && tn_binary_tx;
 }
 
+/**
+ * @brief Returns true if the negotiation timeout has been exceeded.
+ *
+ * Once binary mode is established this always returns false.
+ * The timeout value is configured via @c CONFIG_SERIAL2NET_TELNET_NEGOTIATION_TIMEOUT_MS.
+ */
 bool telnet_negotiation_timed_out(void)
 {
     if (telnet_is_binary_mode()) {
@@ -216,6 +260,7 @@ bool telnet_negotiation_timed_out(void)
     return elapsed >= pdMS_TO_TICKS(CONFIG_SERIAL2NET_TELNET_NEGOTIATION_TIMEOUT_MS);
 }
 
+/** @brief Reset internal state for a new connection. */
 void telnet_reset(void)
 {
     tn_sock           = -1;
@@ -224,3 +269,5 @@ void telnet_reset(void)
     tn_binary_tx      = false;
     tn_connect_ticks  = 0;
 }
+
+/** @} */
