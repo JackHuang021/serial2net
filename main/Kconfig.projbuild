@@ -16,16 +16,22 @@ menu "Serial2Net Configuration"
         endchoice
 
         config SERIAL2NET_WIFI_STA_SSID
-            string "Station SSID"
+            string "Station SSID (factory default)"
             default "myssid"
             help
-                WiFi SSID to connect to in Station mode.
+                Factory-default WiFi SSID for Station mode.
+                When credentials are saved via the web UI, they override
+                this value and persist across reboots in NVS.
+                Erase NVS flash to restore this factory default.
 
         config SERIAL2NET_WIFI_STA_PASSWORD
-            string "Station Password"
+            string "Station Password (factory default)"
             default "mypassword"
             help
-                WiFi password for Station mode.
+                Factory-default WiFi password for Station mode.
+                When credentials are saved via the web UI, they override
+                this value and persist across reboots in NVS.
+                Erase NVS flash to restore this factory default.
 
         config SERIAL2NET_WIFI_STA_MAX_RETRY
             int "Station max retry count"
@@ -149,6 +155,38 @@ menu "Serial2Net Configuration"
                 Close the Telnet connection if binary transmission mode
                 is not negotiated within this time. Modern telnet clients
                 complete negotiation within milliseconds.
+    endmenu
+
+    menu "HTTP Configuration Server"
+        config SERIAL2NET_HTTP_CONFIG_ENABLE
+            bool "Enable on-demand WiFi config portal"
+            default y
+            help
+                When STA fails to connect at boot, or when the BOOT
+                button is held down, the device starts an AP with a
+                web-based WiFi configuration interface (port 80).
+
+                The portal provides scan, select, and connect
+                functionality and stops automatically once a WiFi
+                connection is established. Connect to the AP:
+                  SSID:     serial2net
+                  Password: 12345678
+                  URL:      http://192.168.4.1/
+
+                If disabled, WiFi credentials can only be set via
+                Kconfig at compile time.
+
+        config SERIAL2NET_BOOT_BUTTON_PIN
+            int "BOOT Button GPIO"
+            default 0 if IDF_TARGET_ESP32S3
+            default 0 if IDF_TARGET_ESP32C3
+            default 0
+            depends on SERIAL2NET_HTTP_CONFIG_ENABLE
+            help
+                GPIO pin connected to the BOOT button (active low,
+                internal pull-up enabled).  Hold for ≥400 ms to
+                enter the WiFi configuration portal manually.
+
     endmenu
 
 endmenu

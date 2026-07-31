@@ -22,6 +22,7 @@
 #include "esp_mac.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "mdns.h"
 #include "led_strip.h"
 #include "lwip/err.h"
@@ -29,17 +30,14 @@
 #include "lwip/sys.h"
 #include "sdkconfig.h"
 #include "telnet.h"
+#include "wifi_config.h"
 
 static const char *TAG = "serial2net";
 
-/** @name WiFi Event Group Bits
- *  @{ */
-#define WIFI_CONNECTED_BIT  BIT0  /**< Station connected to AP */
-#define WIFI_FAIL_BIT       BIT1  /**< Station connection failed */
-/** @} */
-
-static EventGroupHandle_t wifi_event_group;
-static int wifi_retry_count = 0;
+/** @brief Shared with wifi_config.c for reconnection logic. */
+EventGroupHandle_t wifi_event_group;
+int  wifi_retry_count   = 0;
+bool wifi_reconfiguring = false;  /**< Set by wifi_config during manual reconnect */
 
 /** @name TCP Connection State
  *  @brief Shared client state — both raw TCP and Telnet code paths
@@ -269,12 +267,19 @@ static void wifi_event_handler(void *arg,
             ESP_LOGI(TAG, "WiFi STA connected to AP");
             break;
         case WIFI_EVENT_STA_DISCONNECTED: {
-            current_led_state = LED_WIFI_CONNECTING;
             wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)event_data;
             ESP_LOGW(TAG, "WiFi STA disconnected, reason: %d", ev->reason);
 
 #if CONFIG_SERIAL2NET_WIFI_MODE_STA || CONFIG_SERIAL2NET_WIFI_MODE_STA_AP_FALLBACK
-            if (wifi_retry_count < CONFIG_SERIAL2NET_WIFI_STA_MAX_RETRY) {
+            if (wifi_reconfiguring) {
+                /*
+                 * wifi_config is handling the reconnect — don't
+                 * auto-retry or set WIFI_FAIL_BIT here.  The deferred
+                 * connect task will clear this flag before connecting.
+                 */
+                ESP_LOGI(TAG, "Reconfiguring — deferred connect pending");
+            } else if (wifi_retry_count < CONFIG_SERIAL2NET_WIFI_STA_MAX_RETRY) {
+                current_led_state = LED_WIFI_CONNECTING;
                 esp_wifi_connect();
                 wifi_retry_count++;
                 ESP_LOGI(TAG, "Retry %d/%d connecting to AP",
@@ -306,6 +311,23 @@ static void wifi_event_handler(void *arg,
             wifi_retry_count = 0;
             current_led_state = LED_WIFI_STA_OK;
             xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+#if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
+            /*
+             * If the config portal is NOT active (normal boot), disable the
+             * AP — STA is connected, no need for the fallback AP anymore.
+             *
+             * If the portal IS active (user just configured WiFi through it),
+             * leave AP alone — the web UI will call /api/close when ready.
+             */
+            if (!wifi_config_is_active()) {
+                wifi_mode_t wm;
+                if (esp_wifi_get_mode(&wm) == ESP_OK && wm == WIFI_MODE_APSTA) {
+                    esp_wifi_set_mode(WIFI_MODE_STA);
+                    ESP_LOGI(TAG, "AP disabled, STA-only mode");
+                }
+            }
+#endif
             break;
         }
         }
@@ -361,13 +383,27 @@ static void wifi_init(void)
     /* ---- Pure STA mode ---- */
     esp_netif_create_default_wifi_sta();
 
-    wifi_config_t sta_cfg = {
-        .sta = {
-            .ssid = CONFIG_SERIAL2NET_WIFI_STA_SSID,
-            .password = CONFIG_SERIAL2NET_WIFI_STA_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
+    wifi_config_t sta_cfg = {0};
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    /* Try NVS-saved credentials first, fall back to Kconfig defaults. */
+    char nvs_ssid[33] = {0};
+    char nvs_pw[65]   = {0};
+    if (wifi_config_load_sta_creds(nvs_ssid, sizeof(nvs_ssid),
+                                    nvs_pw, sizeof(nvs_pw)) == ESP_OK) {
+        strncpy((char *)sta_cfg.sta.ssid, nvs_ssid,
+                sizeof(sta_cfg.sta.ssid) - 1);
+        strncpy((char *)sta_cfg.sta.password, nvs_pw,
+                sizeof(sta_cfg.sta.password) - 1);
+        ESP_LOGI(TAG, "STA mode: using saved credentials, SSID=%s", nvs_ssid);
+    } else {
+        strncpy((char *)sta_cfg.sta.ssid, CONFIG_SERIAL2NET_WIFI_STA_SSID,
+                sizeof(sta_cfg.sta.ssid) - 1);
+        strncpy((char *)sta_cfg.sta.password, CONFIG_SERIAL2NET_WIFI_STA_PASSWORD,
+                sizeof(sta_cfg.sta.password) - 1);
+        ESP_LOGI(TAG, "STA mode: using factory credentials, SSID=%s",
+                 CONFIG_SERIAL2NET_WIFI_STA_SSID);
+    }
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -387,13 +423,27 @@ static void wifi_init(void)
     esp_netif_create_default_wifi_sta();
     esp_netif_create_default_wifi_ap();
 
-    wifi_config_t sta_cfg = {
-        .sta = {
-            .ssid = CONFIG_SERIAL2NET_WIFI_STA_SSID,
-            .password = CONFIG_SERIAL2NET_WIFI_STA_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
+    wifi_config_t sta_cfg = {0};
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    /* Try NVS-saved credentials first, fall back to Kconfig defaults. */
+    char nvs_ssid[33] = {0};
+    char nvs_pw[65]   = {0};
+    if (wifi_config_load_sta_creds(nvs_ssid, sizeof(nvs_ssid),
+                                    nvs_pw, sizeof(nvs_pw)) == ESP_OK) {
+        strncpy((char *)sta_cfg.sta.ssid, nvs_ssid,
+                sizeof(sta_cfg.sta.ssid) - 1);
+        strncpy((char *)sta_cfg.sta.password, nvs_pw,
+                sizeof(sta_cfg.sta.password) - 1);
+        ESP_LOGI(TAG, "STA+AP: using saved credentials, SSID=%s", nvs_ssid);
+    } else {
+        strncpy((char *)sta_cfg.sta.ssid, CONFIG_SERIAL2NET_WIFI_STA_SSID,
+                sizeof(sta_cfg.sta.ssid) - 1);
+        strncpy((char *)sta_cfg.sta.password, CONFIG_SERIAL2NET_WIFI_STA_PASSWORD,
+                sizeof(sta_cfg.sta.password) - 1);
+        ESP_LOGI(TAG, "STA+AP: using factory credentials, SSID=%s",
+                 CONFIG_SERIAL2NET_WIFI_STA_SSID);
+    }
     wifi_config_t ap_cfg = {
         .ap = {
             .ssid = CONFIG_SERIAL2NET_WIFI_AP_SSID,
@@ -857,18 +907,58 @@ static void tcp_accept_task(void *pvParameters)
  *  @brief Application entry point and initialisation sequence.
  *  @{ */
 
+#if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
+
+#define BOOT_BUTTON_DEBOUNCE_TICKS  8   /**< 8 × 50 ms = 400 ms press  */
+#define BOOT_BUTTON_POLL_MS         50
+
+/**
+ * @brief Monitor the BOOT button (GPIO0, active-low) with debounce.
+ *
+ * A sustained press (≥400 ms) triggers the WiFi configuration portal.
+ * Runs at low priority (3) to avoid interfering with data forwarding.
+ */
+static void boot_button_task(void *pvParameters)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = BIT64(CONFIG_SERIAL2NET_BOOT_BUTTON_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    int press_ticks = 0;
+
+    while (1) {
+        if (gpio_get_level(CONFIG_SERIAL2NET_BOOT_BUTTON_PIN) == 0) {
+            press_ticks++;
+            if (press_ticks == BOOT_BUTTON_DEBOUNCE_TICKS) {
+                ESP_LOGI(TAG, "BOOT button pressed — opening config portal");
+                wifi_config_start();
+            }
+        } else {
+            press_ticks = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(BOOT_BUTTON_POLL_MS));
+    }
+}
+#endif /* CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE */
+
 /**
  * @brief Application entry point.
  *
  * Initialisation order:
- *   1. LED        — early visual feedback
- *   2. NVS        — required by WiFi
- *   3. WiFi       — STA / AP / STA+AP
- *   4. mDNS       — advertise serial2net.local
- *   5. UART       — target device UART
- *   6. TCP server — raw bridge on port CONFIG_SERIAL2NET_TCP_PORT
- *   7. Telnet     — RFC 854 bridge on CONFIG_SERIAL2NET_TELNET_PORT
- *   8. FreeRTOS tasks — uart2tcp, tcp2uart, tcp_accept, telnet_accept
+ *   1. LED         — early visual feedback
+ *   2. NVS         — required by WiFi
+ *   3. WiFi        — STA / AP / STA+AP (NVS credentials take priority)
+ *   4. mDNS        — advertise serial2net.local
+ *   5. HTTP config — WiFi setup web UI on port 80
+ *   6. UART        — target device UART
+ *   7. TCP server  — raw bridge on port CONFIG_SERIAL2NET_TCP_PORT
+ *   8. Telnet      — RFC 854 bridge on CONFIG_SERIAL2NET_TELNET_PORT
+ *   9. FreeRTOS tasks — uart2tcp, tcp2uart, tcp_accept, telnet_accept
  */
 void app_main(void)
 {
@@ -894,6 +984,22 @@ void app_main(void)
     /* Start mDNS so we can be discovered as serial2net.local */
     mdns_init_service();
 
+#if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
+    /*
+     * If STA didn't connect, start the WiFi configuration portal so the
+     * user can scan and connect to a network.  Once STA gets an IP, the
+     * event handler above will call wifi_config_stop().
+     */
+    if (!(xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT)) {
+        wifi_config_start();
+    }
+#endif
+
+#if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
+    /* Start BOOT button monitor (long-press to enter config mode). */
+    xTaskCreate(boot_button_task, "boot_btn", 2048, NULL, 3, NULL);
+#endif
+
     /* Initialize UART */
     uart_init();
 
@@ -917,6 +1023,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Bridge running — connect via:");
     ESP_LOGI(TAG, "  Raw TCP: serial2net.local:%d   (socat/nc, low latency)",
              CONFIG_SERIAL2NET_TCP_PORT);
+#if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
+    if (wifi_config_is_active()) {
+        ESP_LOGI(TAG, "  Config:  http://192.168.4.1/   (WiFi setup portal)");
+    }
+#endif
 #if CONFIG_SERIAL2NET_TELNET_ENABLE
     ESP_LOGI(TAG, "  Telnet:  serial2net.local:%d   (standard telnet client)",
              CONFIG_SERIAL2NET_TELNET_PORT);
