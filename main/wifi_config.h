@@ -1,14 +1,18 @@
 /**
  * @file    wifi_config.h
- * @brief   On-demand WiFi configuration via web UI (AP mode).
+ * @brief   HTTP configuration server and WiFi AP management.
  *
- * When the device cannot connect to a WiFi network at boot, or when the
- * BOOT button is pressed, an AP with a captive web UI is started so the
- * user can scan, select, and connect to a network.  Once connected, the
- * HTTP server stops — it only runs while needed.
+ * The HTTP server (port 80) starts after WiFi init and stays running for
+ * the lifetime of the application — accessible on both STA and AP
+ * interfaces.  UART baud rate and WiFi credentials can be changed at
+ * runtime through the web UI.
  *
- * Credentials are persisted in NVS and take priority over Kconfig
- * compile-time defaults on subsequent boots.
+ * The AP is managed independently: it starts automatically when STA
+ * fails at boot, can be toggled via the BOOT button, and stops when STA
+ * obtains an IP address (to save power).
+ *
+ * Credentials and UART settings are persisted in NVS and take priority
+ * over Kconfig compile-time defaults on subsequent boots.
  */
 
 #pragma once
@@ -18,6 +22,7 @@
 #include "freertos/event_groups.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,42 +34,67 @@ extern "C" {
 #define WIFI_FAIL_BIT       BIT1  /**< Station connection failed */
 /** @} */
 
-/**
- * @brief Start the WiFi configuration portal.
- *
- * Switches the WiFi interface to AP+STA mode (or pure AP if STA is
- * unavailable), starts the HTTP server on port 80, and serves the
- * embedded web UI.
- *
- * Call this when:
- *   - STA connection fails at boot
- *   - BOOT button is pressed during connection attempts
- *
- * @retval ESP_OK  Configuration portal started.
- */
-esp_err_t wifi_config_start(void);
+/* ================================================================
+ *  HTTP Server (always-on)
+ * ================================================================ */
 
 /**
- * @brief Stop the WiFi configuration portal immediately.
+ * @brief Start the HTTP configuration server.
  *
- * Stops the HTTP server right away.  Prefer wifi_config_schedule_stop()
- * so the web UI has time to poll /api/status and show the "Connected"
- * confirmation before the server goes down.
+ * Binds to port 80 on all interfaces (INADDR_ANY), so it is reachable
+ * via both STA and AP.  Call once after WiFi init — the server runs
+ * for the lifetime of the application.
  *
- * @retval ESP_OK  Configuration portal stopped.
+ * @retval ESP_OK              Server started.
+ * @retval ESP_ERR_INVALID_STATE  Server is already running.
  */
-esp_err_t wifi_config_stop(void);
+esp_err_t wifi_config_init_http(void);
+
+/* ================================================================
+ *  AP Management (independent lifecycle)
+ * ================================================================ */
 
 /**
- * @brief Schedule a delayed stop of the configuration portal.
+ * @brief Start the configuration AP (if not already running).
+ *
+ * Ensures the AP netif exists and the AP radio is on.  If the device
+ * is in pure STA mode, it switches to APSTA mode and configures the
+ * AP with the Kconfig SSID/password.
+ *
+ * @retval ESP_OK  AP is running.
+ */
+esp_err_t wifi_config_ap_start(void);
+
+/**
+ * @brief Stop the AP radio.
+ *
+ * If the device is in APSTA mode, switches to STA-only to save power.
+ * The HTTP server is NOT affected — it remains reachable on the STA
+ * interface.
+ *
+ * @retval ESP_OK  AP stopped (or was not running).
+ */
+esp_err_t wifi_config_ap_stop(void);
+
+/**
+ * @brief Returns true if the configuration AP is currently active.
+ */
+bool wifi_config_ap_is_active(void);
+
+/**
+ * @brief Schedule a delayed stop of the AP.
  *
  * Spawns a short-lived task that waits @p delay_ms milliseconds, then
- * calls wifi_config_stop().  This gives the web UI enough time to
- * poll /api/status a few times and display the connection result.
+ * calls wifi_config_ap_stop().  Used by the web UI's /api/close
+ * handler to give the response time to flush before the AP goes down.
  *
- * @param delay_ms  Delay before stopping (e.g. 12000 for 12 seconds).
+ * @param delay_ms  Delay before stopping (e.g. 500 for 500 ms).
  */
-void wifi_config_schedule_stop(uint32_t delay_ms);
+void wifi_config_schedule_ap_stop(uint32_t delay_ms);
+
+/* ================================================================
+ *  NVS Persistence
+ * ================================================================ */
 
 /**
  * @brief Load STA credentials from NVS.
@@ -84,9 +114,29 @@ esp_err_t wifi_config_load_sta_creds(char *ssid, size_t ssid_len,
                                       char *password, size_t pw_len);
 
 /**
- * @brief Returns true if the configuration portal is currently active.
+ * @brief Load saved UART baud rate from NVS.
+ *
+ * Reads the "uart_baud" key from the "wifi_cfg" namespace.  If no
+ * value has been saved, falls back to CONFIG_SERIAL2NET_UART_BAUD.
+ *
+ * @param[out] baud  Set to the saved baud rate or the Kconfig default.
+ *
+ * @retval ESP_OK              Value loaded (or fallback used).
+ * @retval ESP_ERR_NVS_*       NVS access error (fallback still set).
  */
-bool wifi_config_is_active(void);
+esp_err_t wifi_config_load_uart_baud(uint32_t *baud);
+
+/**
+ * @brief Save UART baud rate to NVS.
+ *
+ * Writes the "uart_baud" key to the "wifi_cfg" namespace and commits.
+ *
+ * @param baud  Baud rate to persist (e.g. 115200, 921600).
+ *
+ * @retval ESP_OK         Saved successfully.
+ * @retval ESP_ERR_NVS_*  NVS write/commit error.
+ */
+esp_err_t wifi_config_save_uart_baud(uint32_t baud);
 
 #ifdef __cplusplus
 }

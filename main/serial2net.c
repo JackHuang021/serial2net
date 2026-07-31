@@ -314,19 +314,10 @@ static void wifi_event_handler(void *arg,
 
 #if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
             /*
-             * If the config portal is NOT active (normal boot), disable the
-             * AP — STA is connected, no need for the fallback AP anymore.
-             *
-             * If the portal IS active (user just configured WiFi through it),
-             * leave AP alone — the web UI will call /api/close when ready.
+             * STA has an IP — AP no longer needed, disable it to save
+             * power.  HTTP stays up on the STA interface regardless.
              */
-            if (!wifi_config_is_active()) {
-                wifi_mode_t wm;
-                if (esp_wifi_get_mode(&wm) == ESP_OK && wm == WIFI_MODE_APSTA) {
-                    esp_wifi_set_mode(WIFI_MODE_STA);
-                    ESP_LOGI(TAG, "AP disabled, STA-only mode");
-                }
-            }
+            wifi_config_ap_stop();
 #endif
             break;
         }
@@ -518,13 +509,13 @@ static void mdns_init_service(void)
 /**
  * @brief Initialise the UART peripheral in 8N1 mode.
  *
- * Pins and baud rate are taken from Kconfig.  A 20-deep event queue
- * is created for UART events (used for pattern detection, etc.).
+ * @param baud  Baud rate (from NVS or Kconfig default).
+ *              Pins and other params are taken from Kconfig.
  */
-static void uart_init(void)
+static void uart_init(uint32_t baud)
 {
     uart_config_t uart_config = {
-        .baud_rate  = CONFIG_SERIAL2NET_UART_BAUD,
+        .baud_rate  = (int)baud,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
@@ -542,8 +533,8 @@ static void uart_init(void)
                                  CONFIG_SERIAL2NET_UART_RX_PIN,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    ESP_LOGI(TAG, "UART%d: baud=%d TX=GPIO%d RX=GPIO%d",
-             CONFIG_SERIAL2NET_UART_PORT, CONFIG_SERIAL2NET_UART_BAUD,
+    ESP_LOGI(TAG, "UART%d: baud=%" PRIu32 " TX=GPIO%d RX=GPIO%d",
+             CONFIG_SERIAL2NET_UART_PORT, baud,
              CONFIG_SERIAL2NET_UART_TX_PIN, CONFIG_SERIAL2NET_UART_RX_PIN);
 }
 
@@ -935,8 +926,13 @@ static void boot_button_task(void *pvParameters)
         if (gpio_get_level(CONFIG_SERIAL2NET_BOOT_BUTTON_PIN) == 0) {
             press_ticks++;
             if (press_ticks == BOOT_BUTTON_DEBOUNCE_TICKS) {
-                ESP_LOGI(TAG, "BOOT button pressed — opening config portal");
-                wifi_config_start();
+                if (wifi_config_ap_is_active()) {
+                    ESP_LOGI(TAG, "BOOT button pressed — stopping AP");
+                    wifi_config_ap_stop();
+                } else {
+                    ESP_LOGI(TAG, "BOOT button pressed — starting AP");
+                    wifi_config_ap_start();
+                }
             }
         } else {
             press_ticks = 0;
@@ -986,22 +982,31 @@ void app_main(void)
 
 #if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
     /*
-     * If STA didn't connect, start the WiFi configuration portal so the
-     * user can scan and connect to a network.  Once STA gets an IP, the
-     * event handler above will call wifi_config_stop().
+     * HTTP configuration server — always on after WiFi init.
+     * Binds INADDR_ANY:80, reachable via both STA and AP interfaces.
+     */
+    wifi_config_init_http();
+
+    /*
+     * If STA didn't connect, start the configuration AP so the
+     * user can reach the web UI at http://192.168.4.1/.
      */
     if (!(xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT)) {
-        wifi_config_start();
+        wifi_config_ap_start();
     }
 #endif
 
 #if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
-    /* Start BOOT button monitor (long-press to enter config mode). */
+    /* Start BOOT button monitor (long-press toggles AP). */
     xTaskCreate(boot_button_task, "boot_btn", 2048, NULL, 3, NULL);
 #endif
 
+    /* Load UART baud rate from NVS (falls back to Kconfig default). */
+    uint32_t uart_baud;
+    wifi_config_load_uart_baud(&uart_baud);
+
     /* Initialize UART */
-    uart_init();
+    uart_init(uart_baud);
 
     /* Initialize TCP server (raw) */
     tcp_server_init();
@@ -1024,8 +1029,8 @@ void app_main(void)
     ESP_LOGI(TAG, "  Raw TCP: serial2net.local:%d   (socat/nc, low latency)",
              CONFIG_SERIAL2NET_TCP_PORT);
 #if CONFIG_SERIAL2NET_HTTP_CONFIG_ENABLE
-    if (wifi_config_is_active()) {
-        ESP_LOGI(TAG, "  Config:  http://192.168.4.1/   (WiFi setup portal)");
+    if (wifi_config_ap_is_active()) {
+        ESP_LOGI(TAG, "  Config:  http://192.168.4.1/   (WiFi setup AP)");
     }
 #endif
 #if CONFIG_SERIAL2NET_TELNET_ENABLE

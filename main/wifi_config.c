@@ -27,6 +27,7 @@
 #include "esp_http_server.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
+#include "driver/uart.h"
 #include "sdkconfig.h"
 
 /* ---- Externs (owned by serial2net.c) ---- */
@@ -44,7 +45,8 @@ extern bool               wifi_reconfiguring;
 
 /* ---- Local state ---- */
 static httpd_handle_t    server              = NULL;
-static bool              portal_active       = false;
+static bool              httpd_running       = false;
+static bool              ap_active           = false;
 static wifi_ap_record_t  scan_records[WIFI_CFG_MAX_SCAN_RESULTS];
 static uint16_t          scan_count          = 0;
 static bool              scan_in_progress    = false;
@@ -192,6 +194,43 @@ static esp_err_t save_sta_creds_to_nvs(const char *ssid, const char *password)
     if (err == ESP_OK) {
         err = nvs_set_str(handle, WIFI_CFG_NVS_KEY_PW, password);
     }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+/* ================================================================
+ *  UART config persistence
+ * ================================================================ */
+
+#define WIFI_CFG_NVS_KEY_UART_BAUD  "uart_baud"
+
+esp_err_t wifi_config_load_uart_baud(uint32_t *baud)
+{
+    *baud = CONFIG_SERIAL2NET_UART_BAUD;  /* fallback default */
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_CFG_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+
+    uint32_t val;
+    err = nvs_get_u32(handle, WIFI_CFG_NVS_KEY_UART_BAUD, &val);
+    if (err == ESP_OK) {
+        *baud = val;
+    }
+    nvs_close(handle);
+    return err;
+}
+
+esp_err_t wifi_config_save_uart_baud(uint32_t baud)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WIFI_CFG_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_u32(handle, WIFI_CFG_NVS_KEY_UART_BAUD, baud);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
@@ -487,7 +526,7 @@ static esp_err_t api_status_handler(httpd_req_t *req)
              connected ? "true" : "false",
              failed ? "true" : "false");
 
-    ESP_LOGI(TAG, "/api/status → %s", json);
+    ESP_LOGD(TAG, "/api/status → %s", json);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
@@ -507,10 +546,88 @@ static esp_err_t api_close_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
 
-    /* Stop the server after the response has been sent.
+    /* Stop the AP after the response has been sent.
      * Use a short delay so the TCP stack can flush the response. */
-    wifi_config_schedule_stop(500);
+    wifi_config_schedule_ap_stop(500);
     return ESP_OK;
+}
+
+/* ================================================================
+ *  UART config API handlers
+ * ================================================================ */
+
+static esp_err_t api_uart_get_handler(httpd_req_t *req)
+{
+    char json[256];
+    snprintf(json, sizeof(json),
+             "{\"baud\":%d,\"port\":%d,\"tx_pin\":%d,\"rx_pin\":%d,"
+             "\"data_bits\":8,\"parity\":\"none\",\"stop_bits\":1}",
+             CONFIG_SERIAL2NET_UART_BAUD,
+             CONFIG_SERIAL2NET_UART_PORT,
+             CONFIG_SERIAL2NET_UART_TX_PIN,
+             CONFIG_SERIAL2NET_UART_RX_PIN);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t api_uart_post_handler(httpd_req_t *req)
+{
+    char body[64] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"empty request body\"}");
+    }
+
+    /* Parse "baud" value from JSON body: {"baud":115200} */
+    const char *p = strstr(body, "\"baud\"");
+    if (!p) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"missing 'baud' field\"}");
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"invalid JSON\"}");
+    }
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+
+    long baud = strtol(p, NULL, 10);
+    if (baud < 1200 || baud > 4000000) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req,
+            "{\"error\":\"invalid baud rate (1200–4000000)\"}");
+    }
+
+    /* Save to NVS */
+    esp_err_t err = wifi_config_save_uart_baud((uint32_t)baud);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS save failed: %s", esp_err_to_name(err));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"failed to save to NVS\"}");
+    }
+
+    /* Apply immediately */
+    err = uart_set_baudrate(CONFIG_SERIAL2NET_UART_PORT, (uint32_t)baud);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "uart_set_baudrate failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "UART baud rate changed to %ld", baud);
+    }
+
+    char resp[128];
+    snprintf(resp, sizeof(resp),
+             "{\"status\":\"ok\",\"baud\":%ld}", baud);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
 
 /* ================================================================
@@ -560,34 +677,28 @@ static esp_err_t ensure_ap_running(void)
     return ESP_OK;
 }
 
-esp_err_t wifi_config_start(void)
+esp_err_t wifi_config_init_http(void)
 {
-    if (portal_active) {
-        ESP_LOGW(TAG, "Config portal already running");
+    if (httpd_running) {
+        ESP_LOGW(TAG, "HTTP server already running");
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Starting WiFi configuration portal...");
-
-    /* Make sure a network interface is available for the AP. */
-    esp_err_t err = ensure_ap_running();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to ensure AP is running: %s", esp_err_to_name(err));
-        return err;
-    }
+    ESP_LOGI(TAG, "Starting HTTP configuration server...");
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port      = 80;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
     config.max_open_sockets = 4;
     config.lru_purge_enable = true;
 
-    err = httpd_start(&server, &config);
+    esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(err));
         return err;
     }
 
+    /* ---- Register URI handlers ---- */
     const httpd_uri_t root_uri = {
         .uri = "/", .method = HTTP_GET,
         .handler = root_get_handler, .user_ctx = NULL,
@@ -604,10 +715,18 @@ esp_err_t wifi_config_start(void)
         .uri = "/api/status", .method = HTTP_GET,
         .handler = api_status_handler, .user_ctx = NULL,
     };
-
     const httpd_uri_t close_uri = {
         .uri = "/api/close", .method = HTTP_POST,
         .handler = api_close_handler, .user_ctx = NULL,
+    };
+
+    const httpd_uri_t uart_get_uri = {
+        .uri = "/api/uart", .method = HTTP_GET,
+        .handler = api_uart_get_handler, .user_ctx = NULL,
+    };
+    const httpd_uri_t uart_post_uri = {
+        .uri = "/api/uart", .method = HTTP_POST,
+        .handler = api_uart_post_handler, .user_ctx = NULL,
     };
 
     httpd_register_uri_handler(server, &root_uri);
@@ -615,31 +734,43 @@ esp_err_t wifi_config_start(void)
     httpd_register_uri_handler(server, &connect_uri);
     httpd_register_uri_handler(server, &status_uri);
     httpd_register_uri_handler(server, &close_uri);
+    httpd_register_uri_handler(server, &uart_get_uri);
+    httpd_register_uri_handler(server, &uart_post_uri);
 
-    portal_active = true;
-    ESP_LOGI(TAG, "Config portal active — connect to '%s' and open http://192.168.4.1/",
+    httpd_running = true;
+    ESP_LOGI(TAG, "HTTP server on port 80");
+    return ESP_OK;
+}
+
+esp_err_t wifi_config_ap_start(void)
+{
+    if (ap_active) {
+        ESP_LOGW(TAG, "Config AP already running");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Starting configuration AP...");
+
+    esp_err_t err = ensure_ap_running();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to ensure AP is running: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ap_active = true;
+    ESP_LOGI(TAG, "Config AP active — connect to '%s' and open http://192.168.4.1/",
              CONFIG_SERIAL2NET_WIFI_AP_SSID);
     return ESP_OK;
 }
 
-esp_err_t wifi_config_stop(void)
+esp_err_t wifi_config_ap_stop(void)
 {
-    if (!portal_active) {
+    if (!ap_active) {
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Stopping WiFi configuration portal");
-    portal_active = false;
-
-    /* Stop HTTP server. */
-    esp_err_t err = ESP_OK;
-    if (server) {
-        err = httpd_stop(server);
-        server = NULL;
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to stop HTTP server: %s", esp_err_to_name(err));
-        }
-    }
+    ESP_LOGI(TAG, "Stopping configuration AP");
+    ap_active = false;
 
     /* Disable AP radio — no longer needed once STA is connected. */
 #if !CONFIG_SERIAL2NET_WIFI_MODE_AP
@@ -650,31 +781,31 @@ esp_err_t wifi_config_stop(void)
     }
 #endif
 
-    return err;
+    return ESP_OK;
 }
 
-bool wifi_config_is_active(void)
+bool wifi_config_ap_is_active(void)
 {
-    return portal_active;
+    return ap_active;
 }
 
 /**
- * @brief Task that waits delay_ms, then stops the config portal.
+ * @brief Task that waits delay_ms, then stops the AP.
  */
-static void delayed_stop_task(void *pvParameters)
+static void delayed_ap_stop_task(void *pvParameters)
 {
     uint32_t delay_ms = (uint32_t)(uintptr_t)pvParameters;
     vTaskDelay(pdMS_TO_TICKS(delay_ms));
-    wifi_config_stop();
+    wifi_config_ap_stop();
     vTaskDelete(NULL);
 }
 
-void wifi_config_schedule_stop(uint32_t delay_ms)
+void wifi_config_schedule_ap_stop(uint32_t delay_ms)
 {
-    if (!portal_active) return;
+    if (!ap_active) return;
 
-    ESP_LOGI(TAG, "Config portal will stop in %" PRIu32 " ms", delay_ms);
-    xTaskCreate(delayed_stop_task, "cfg_stop", 2048,
+    ESP_LOGI(TAG, "Config AP will stop in %" PRIu32 " ms", delay_ms);
+    xTaskCreate(delayed_ap_stop_task, "ap_stop", 2048,
                 (void *)(uintptr_t)delay_ms, 1, NULL);
 }
 
@@ -786,6 +917,41 @@ h2{font-size:0.8rem;font-weight:500;text-transform:uppercase;
 <div class="card" id="status-card">
   <h2>Current Status</h2>
   <div id="status-content">Loading...</div>
+</div>
+
+<div class="card">
+  <h2>UART Settings</h2>
+  <div class="input-group">
+    <label for="baud-select">Baud Rate</label>
+    <div class="input-row">
+      <select id="baud-select" style="flex:1;padding:10px 12px;background:#13132a;
+        border:1px solid #2a2a40;border-radius:8px;color:#f0f0f0;font-size:0.9rem;outline:none;">
+        <option value="1200">1200</option>
+        <option value="2400">2400</option>
+        <option value="4800">4800</option>
+        <option value="9600">9600</option>
+        <option value="14400">14400</option>
+        <option value="19200">19200</option>
+        <option value="38400">38400</option>
+        <option value="57600">57600</option>
+        <option value="115200">115200</option>
+        <option value="230400">230400</option>
+        <option value="460800">460800</option>
+        <option value="921600">921600</option>
+        <option value="1000000">1000000</option>
+        <option value="1500000">1500000</option>
+        <option value="2000000">2000000</option>
+        <option value="3000000">3000000</option>
+        <option value="4000000">4000000</option>
+      </select>
+    </div>
+  </div>
+  <div style="margin-top:12px">
+    <button class="btn btn-primary" id="uart-apply-btn" onclick="doApplyUart()">
+      Apply
+    </button>
+  </div>
+  <div id="uart-status"></div>
 </div>
 
 <div class="card">
@@ -1013,6 +1179,47 @@ function updateStatus() {
     .catch(function(){});
 }
 
+function loadUartConfig() {
+  fetch('/api/uart', {cache:'no-store'})
+    .then(function(r){return r.json()})
+    .then(function(cfg){
+      document.getElementById('baud-select').value = cfg.baud;
+    })
+    .catch(function(){});
+}
+
+function doApplyUart() {
+  var baud = parseInt(document.getElementById('baud-select').value);
+  var btn = document.getElementById('uart-apply-btn');
+  var st  = document.getElementById('uart-status');
+  btn.disabled = true;
+  st.className = '';
+  st.innerHTML = '<span class="spinner"></span>Applying...';
+  fetch('/api/uart', {
+    method: 'POST',
+    cache: 'no-store',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({baud: baud})
+  })
+    .then(function(r){return r.json()})
+    .then(function(data){
+      btn.disabled = false;
+      if (data.error) {
+        st.textContent = data.error;
+        st.className = 'error';
+      } else {
+        st.textContent = 'Baud rate set to ' + data.baud;
+        st.className = 'ok';
+      }
+    })
+    .catch(function(e){
+      btn.disabled = false;
+      st.textContent = 'Error: ' + e.message;
+      st.className = 'error';
+    });
+}
+
+loadUartConfig();
 updateStatus();
 setInterval(updateStatus, 15000);
 </script>
