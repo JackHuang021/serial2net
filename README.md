@@ -104,18 +104,32 @@ socat -,raw,echo=0,escape=0x1d TCP:192.168.x.x:8880,nodelay
 | AP | ESP32 创建热点 `serial2net`（密码 `12345678`），电脑直连 |
 | STA + AP 回退（默认） | 先尝试 Station，15 秒超时后自动启动 AP |
 
-WiFi 凭据优先级：**NVS 已保存的 > Kconfig 出厂默认值**。通过 Web 配置门户保存的凭据会持久化到 NVS，重启后仍然有效。
+WiFi 凭据优先级：**NVS 已保存的 > Kconfig 出厂默认值**。通过 Web 界面保存的凭据会持久化到 NVS，重启后仍然有效。
 
-## WiFi 配置门户（Web UI）
+## Web 管理界面
 
-当 STA 模式连接失败，或长按 BOOT 按钮（≥400ms）时，设备会自动启动 AP 热点并提供 Web 配置界面：
+设备启动后 HTTP 服务常驻运行（端口 80），可通过 STA IP 或 AP IP 访问。
+
+**STA 正常连接时**：浏览器打开 `http://<设备IP>/` 即可访问管理界面。设备 IP 可通过串口日志或路由器 DHCP 列表查看。
+
+**STA 未连接时**：设备自动启动 AP 热点，长按 BOOT 按钮（≥400ms）也可手动开启/关闭 AP：
 
 1. 电脑连接热点 `serial2net`（密码 `12345678`）
 2. 浏览器打开 `http://192.168.4.1/`
 3. 扫描 WiFi → 选择网络 → 输入密码 → 连接
-4. 连接成功后门户自动关闭，设备切换到 STA 模式
+4. 连接成功后 AP 自动关闭（省电），HTTP 服务仍可通过 STA IP 访问
 
-无需重新编译即可更换 WiFi 网络。
+无需重新编译即可更换 WiFi 网络或调整 UART 参数。
+
+### UART 配置
+
+在 Web 界面中可直接修改 UART 波特率，即时生效，重启后仍保留：
+
+1. 打开管理界面 → **UART Settings** 卡片
+2. 选择目标波特率（支持 1200 – 4,000,000）
+3. 点击 **Apply** 即可生效
+
+波特率保存在 NVS 中，重启后自动加载，优先级高于 Kconfig 编译默认值。其他 UART 参数（端口号、TX/RX 引脚、数据位等）需通过 `menuconfig` 修改并重新编译。
 
 ## LED 状态指示（WS2812B）
 
@@ -146,15 +160,17 @@ WiFi 凭据优先级：**NVS 已保存的 > Kconfig 出厂默认值**。通过 W
 
 ## 架构
 
-单文件嵌入式应用，基于 FreeRTOS 运行。5 个并发任务：
+基于 FreeRTOS 的嵌入式应用。7 个并发任务：
 
 | 任务 | 优先级 | 职责 |
 |------|--------|------|
 | `led` | 5 | 20 Hz LED 状态机（颜色 + 数据闪烁） |
+| `boot_btn` | 3 | 监测 BOOT 按钮，长按切换 AP 开关 |
 | `tcp_accept` | 9 | 阻塞 `accept()`，新连接时踢掉旧客户端 |
 | `telnet_accept` | 9 | 同上，Telnet 端口（需启用 Telnet） |
 | `uart2tcp` | 10 | `uart_read_bytes()` → `send()` 到客户端 |
 | `tcp2uart` | 10 | `recv()` 从客户端 → `uart_write_bytes()` |
+| HTTP (内置) | — | esp_http_server 内部任务，处理 Web 请求 |
 
 **数据流**：UART ↔ 两个独立 FreeRTOS 任务 ↔ 单个 TCP 客户端 socket。全双工透明桥接，无协议帧封装。
 
@@ -170,8 +186,8 @@ serial2net/
 │   ├── serial2net.c            # 主程序：WiFi / UART / TCP / 任务调度
 │   ├── telnet.c                # Telnet 协议（RFC 854 + RFC 856）
 │   ├── telnet.h                # Telnet 协议头文件
-│   ├── wifi_config.c           # WiFi 配置门户（AP + HTTP 服务器）
-│   ├── wifi_config.h           # WiFi 配置门户头文件
+│   ├── wifi_config.c           # HTTP 服务 + WiFi/AP 管理 + Web UI
+│   ├── wifi_config.h           # HTTP/AP/UART 配置 API
 │   └── sdkconfig.ci            # CI 参考配置
 ├── .gitignore
 └── CLAUDE.md                   # AI 辅助开发指南
