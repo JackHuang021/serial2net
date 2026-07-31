@@ -189,4 +189,17 @@ menu "Serial2Net Configuration"
 
     endmenu
 
+    menu "OTA Firmware Update"
+        config SERIAL2NET_OTA_ENABLE
+            bool "Enable OTA firmware update"
+            default y
+            help
+                Enables over-the-air firmware updates via the Web UI
+                (POST /api/ota). Firmware is written to the inactive
+                OTA partition and the device reboots automatically.
+
+                Requires a partition scheme with OTA slots
+                (e.g. custom partitions.csv with factory + ota_0 + ota_1).
+    endmenu
+
 endmenu

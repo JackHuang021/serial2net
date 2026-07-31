@@ -28,6 +28,8 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "sdkconfig.h"
 
 /* ---- Externs (owned by serial2net.c) ---- */
@@ -631,6 +633,152 @@ static esp_err_t api_uart_post_handler(httpd_req_t *req)
 }
 
 /* ================================================================
+ *  OTA firmware update handlers
+ * ================================================================ */
+
+#if CONFIG_SERIAL2NET_OTA_ENABLE
+
+static esp_err_t api_ota_status_handler(httpd_req_t *req)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_app_desc_t *desc = esp_app_get_description();
+
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\"version\":\"%s\","
+        "\"compile_time\":\"%s %s\","
+        "\"idf_version\":\"%s\","
+        "\"partition\":\"%s\","
+        "\"sha256\":\"%02x%02x%02x%02x%02x%02x%02x%02x\"}",
+        desc->version,
+        desc->date, desc->time,
+        desc->idf_ver,
+        running ? running->label : "unknown",
+        desc->app_elf_sha256[0], desc->app_elf_sha256[1],
+        desc->app_elf_sha256[2], desc->app_elf_sha256[3],
+        desc->app_elf_sha256[4], desc->app_elf_sha256[5],
+        desc->app_elf_sha256[6], desc->app_elf_sha256[7]);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t api_ota_post_handler(httpd_req_t *req)
+{
+    char content_len_str[16];
+    if (httpd_req_get_hdr_value_str(req, "Content-Length",
+                                    content_len_str, sizeof(content_len_str)) != ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "411 Length Required");
+        return httpd_resp_sendstr(req, "{\"error\":\"Content-Length required\"}");
+    }
+
+    int total_len = atoi(content_len_str);
+    if (total_len <= 0) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"invalid firmware size\"}");
+    }
+
+    /* Validate against the actual partition size */
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) {
+        ESP_LOGE(TAG, "OTA: no OTA partition found");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"no OTA partition found\"}");
+    }
+
+    if (total_len > (int)part->size) {
+        ESP_LOGE(TAG, "OTA: firmware too large: %d > %" PRIu32, total_len, part->size);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"firmware too large for partition\"}");
+    }
+
+    ESP_LOGI(TAG, "OTA: writing %d bytes to partition %s (size %" PRIu32 ")",
+             total_len, part->label, part->size);
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(part, total_len, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"OTA begin failed\"}");
+    }
+
+    uint8_t *buf = malloc(4096);
+    if (!buf) {
+        esp_ota_end(ota_handle);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"out of memory\"}");
+    }
+
+    int remaining = total_len;
+    int received_total = 0;
+    bool write_failed = false;
+
+    while (remaining > 0) {
+        int to_read = (remaining < 4096) ? remaining : 4096;
+        int received = httpd_req_recv(req, (char *)buf, to_read);
+        if (received <= 0) {
+            ESP_LOGE(TAG, "OTA: recv error at %d / %d bytes (ret=%d)",
+                     received_total, total_len, received);
+            write_failed = true;
+            break;
+        }
+        err = esp_ota_write(ota_handle, buf, received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: write error at %d / %d bytes: %s",
+                     received_total, total_len, esp_err_to_name(err));
+            write_failed = true;
+            break;
+        }
+        remaining -= received;
+        received_total += received;
+    }
+    free(buf);
+
+    if (write_failed) {
+        esp_ota_end(ota_handle);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"OTA write failed\"}");
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_end failed: %s", esp_err_to_name(err));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"OTA end failed\"}");
+    }
+
+    err = esp_ota_set_boot_partition(part);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"failed to set boot partition\"}");
+    }
+
+    ESP_LOGI(TAG, "OTA: %d bytes written to %s — restarting device",
+             received_total, part->label);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"OTA complete, restarting...\"}");
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+#endif /* CONFIG_SERIAL2NET_OTA_ENABLE */
+
+/* ================================================================
  *  HTTP server lifecycle
  * ================================================================ */
 
@@ -736,6 +884,19 @@ esp_err_t wifi_config_init_http(void)
     httpd_register_uri_handler(server, &close_uri);
     httpd_register_uri_handler(server, &uart_get_uri);
     httpd_register_uri_handler(server, &uart_post_uri);
+
+#if CONFIG_SERIAL2NET_OTA_ENABLE
+    const httpd_uri_t ota_post_uri = {
+        .uri = "/api/ota", .method = HTTP_POST,
+        .handler = api_ota_post_handler, .user_ctx = NULL,
+    };
+    const httpd_uri_t ota_status_uri = {
+        .uri = "/api/ota/status", .method = HTTP_GET,
+        .handler = api_ota_status_handler, .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &ota_post_uri);
+    httpd_register_uri_handler(server, &ota_status_uri);
+#endif
 
     httpd_running = true;
     ESP_LOGI(TAG, "HTTP server on port 80");
@@ -952,6 +1113,25 @@ h2{font-size:0.8rem;font-weight:500;text-transform:uppercase;
     </button>
   </div>
   <div id="uart-status"></div>
+</div>
+
+<div class="card">
+  <h2>Firmware Update</h2>
+  <div id="ota-info" style="font-size:0.78rem;color:#888;margin-bottom:8px">Loading info...</div>
+  <div class="input-group">
+    <label for="ota-file">Select .bin firmware file</label>
+    <input type="file" id="ota-file" accept=".bin" style="width:100%;padding:8px 0;color:#d4d4d8;font-size:0.85rem;margin-bottom:8px">
+  </div>
+  <div class="input-row">
+    <button class="btn btn-primary" id="ota-btn" onclick="doOtaUpdate()">
+      Upload &amp; Update
+    </button>
+  </div>
+  <div id="ota-progress" class="hidden">
+    <div id="ota-bar" style="height:6px;background:#00d4aa;border-radius:3px;width:0%;transition:width .2s;margin-top:8px"></div>
+    <div id="ota-pct" style="font-size:0.75rem;color:#888;margin-top:2px"></div>
+  </div>
+  <div id="ota-status" style="padding:8px 0 0;font-size:0.78rem"></div>
 </div>
 
 <div class="card">
@@ -1222,6 +1402,92 @@ function doApplyUart() {
 loadUartConfig();
 updateStatus();
 setInterval(updateStatus, 15000);
+
+/* ---------- OTA firmware update ---------- */
+function loadOtaInfo() {
+  fetch('/api/ota/status', {cache:'no-store'})
+    .then(function(r){return r.json()})
+    .then(function(info){
+      document.getElementById('ota-info').textContent =
+        'Running: ' + info.partition + ' | v' + info.version +
+        ' | Built: ' + info.compile_time;
+    })
+    .catch(function(e){
+      document.getElementById('ota-info').textContent =
+        'OTA not available (' + e.message + ')';
+    });
+}
+
+function doOtaUpdate() {
+  var file = document.getElementById('ota-file').files[0];
+  if (!file) { alert('Select a .bin firmware file first'); return; }
+  if (!confirm('Update firmware to ' + file.name +
+      '?\\n\\nThe device will reboot after the update.')) return;
+
+  var btn = document.getElementById('ota-btn');
+  var bar = document.getElementById('ota-bar');
+  var pct = document.getElementById('ota-pct');
+  var status = document.getElementById('ota-status');
+  var progress = document.getElementById('ota-progress');
+
+  btn.disabled = true;
+  progress.classList.remove('hidden');
+  status.textContent = '';
+  status.className = '';
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ota');
+
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      var p = Math.round(e.loaded / e.total * 100);
+      bar.style.width = p + '%';
+      pct.textContent = p + '%';
+    }
+  };
+
+  xhr.onload = function() {
+    try {
+      var resp = JSON.parse(xhr.responseText);
+      if (resp.error) {
+        status.textContent = resp.error;
+        status.className = 'error';
+        btn.disabled = false;
+        progress.classList.add('hidden');
+      } else {
+        status.textContent = resp.message + ' Reloading page after reboot...';
+        status.className = 'ok';
+        var attempts = 0;
+        var poll = setInterval(function() {
+          fetch('/api/status', {cache:'no-store'})
+            .then(function() {
+              clearInterval(poll);
+              location.reload();
+            })
+            .catch(function(){});
+          if (++attempts > 45) {
+            clearInterval(poll);
+            location.reload();
+          }
+        }, 1000);
+      }
+    } catch(e) {
+      status.textContent = 'Unexpected response from device';
+      status.className = 'error';
+      btn.disabled = false;
+    }
+  };
+
+  xhr.onerror = function() {
+    status.textContent = 'Upload lost — device may be rebooting, page will reload...';
+    status.className = 'error';
+    setTimeout(function(){ location.reload(); }, 6000);
+  };
+
+  xhr.send(file);
+}
+
+loadOtaInfo();
 </script>
 </body>
 </html>
